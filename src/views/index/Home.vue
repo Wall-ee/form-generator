@@ -32,8 +32,8 @@
                 @click="addComponent(element)"
               >
                 <div class="components-body">
-                  <svg-icon :icon-class="element.tagIcon" />
-                  {{ element.label }}
+                  <svg-icon :icon-class="element.__config__.tagIcon" />
+                  {{ element.__config__.label }}
                 </div>
               </div>
             </draggable>
@@ -70,10 +70,10 @@
           >
             <draggable class="drawing-board" :list="drawingList" :animation="340" group="componentsGroup">
               <draggable-item
-                v-for="(element, index) in drawingList"
-                :key="element.renderKey"
+                v-for="(item, index) in drawingList"
+                :key="item.renderKey"
                 :drawing-list="drawingList"
-                :element="element"
+                :current-item="item"
                 :index="index"
                 :active-id="activeId"
                 :form-conf="formConf"
@@ -95,6 +95,7 @@
       :form-conf="formConf"
       :show-field="!!drawingList.length"
       @tag-change="tagChange"
+      @fetch-data="fetchData"
     />
 
     <form-drawer
@@ -107,6 +108,7 @@
       size="60%"
       :visible.sync="jsonDrawerVisible"
       :json-str="JSON.stringify(formData)"
+      @refresh="refreshJson"
     />
     <code-type-dialog
       :visible.sync="dialogVisible"
@@ -122,9 +124,8 @@
 import draggable from 'vuedraggable'
 import { debounce } from 'throttle-debounce'
 import { saveAs } from 'file-saver'
-import beautifier from 'beautifier'
 import ClipboardJS from 'clipboard'
-import render from '@/components/render'
+import render from '@/components/render/render'
 import FormDrawer from './FormDrawer'
 import JsonDrawer from './JsonDrawer'
 import RightPanel from './RightPanel'
@@ -132,7 +133,7 @@ import {
   inputComponents, selectComponents, layoutComponents, formConf
 } from '@/components/generator/config'
 import {
-  exportDefault, beautifierConf, isNumberStr, titleCase
+  exportDefault, beautifierConf, isNumberStr, titleCase, deepClone
 } from '@/utils/index'
 import {
   makeUpHtml, vueTemplate, vueScript, cssStyle
@@ -146,7 +147,9 @@ import DraggableItem from './DraggableItem'
 import {
   getDrawingList, saveDrawingList, getIdGlobal, saveIdGlobal, getFormConf
 } from '@/utils/db'
+import loadBeautifier from '@/utils/loadBeautifier'
 
+let beautifier
 const emptyActiveData = { style: {}, autosize: {} }
 let oldActiveId
 let tempActiveData
@@ -205,10 +208,10 @@ export default {
   },
   watch: {
     // eslint-disable-next-line func-names
-    'activeData.label': function (val, oldVal) {
+    'activeData.__config__.label': function (val, oldVal) {
       if (
         this.activeData.placeholder === undefined
-        || !this.activeData.tag
+        || !this.activeData.__config__.tag
         || oldActiveId !== this.activeId
       ) {
         return
@@ -245,7 +248,9 @@ export default {
     if (formConfInDB) {
       this.formConf = formConfInDB
     }
-
+    loadBeautifier(btf => {
+      beautifier = btf
+    })
     const clipboard = new ClipboardJS('#copyNode', {
       text: trigger => {
         const codeStr = this.generateCode()
@@ -262,42 +267,79 @@ export default {
     })
   },
   methods: {
-    activeFormItem(element) {
-      this.activeData = element
-      this.activeId = element.formId
+    fetchData(component) {
+      const {
+        dataType, method, url, dataKey, renderKey
+      } = component.__config__
+      if (dataType === 'dynamic' && method && url) {
+        this.setLoading(component, true)
+        this.$axios({
+          method,
+          url
+        }).then(resp => {
+          this.setLoading(component, false)
+          if (dataKey) {
+            component.data = dataKey.split('.').reduce((pre, item) => pre[item], resp.data)
+          } else {
+            component.data = resp.data
+          }
+          const i = this.drawingList.findIndex(item => item.__config__.renderKey === renderKey)
+          if (i > -1) this.$set(this.drawingList, i, component)
+        })
+      }
     },
-    onEnd(obj, a) {
+    setLoading(component, val) {
+      const { directives } = component
+      if (Array.isArray(directives)) {
+        const t = directives.find(d => d.name === 'loading')
+        if (t) t.value = val
+      }
+    },
+    activeFormItem(currentItem) {
+      this.activeData = currentItem
+      this.activeId = currentItem.__config__.formId
+    },
+    onEnd(obj) {
       if (obj.from !== obj.to) {
+        this.fetchData(tempActiveData)
         this.activeData = tempActiveData
         this.activeId = this.idGlobal
       }
     },
     addComponent(item) {
       const clone = this.cloneComponent(item)
+      this.fetchData(clone)
       this.drawingList.push(clone)
       this.activeFormItem(clone)
     },
     cloneComponent(origin) {
-      const clone = JSON.parse(JSON.stringify(origin))
-      clone.formId = ++this.idGlobal
-      clone.span = formConf.span
-      clone.renderKey = +new Date() // 改变renderKey后可以实现强制更新组件
-      if (!clone.layout) clone.layout = 'colFormItem'
-      if (clone.layout === 'colFormItem') {
-        clone.vModel = `field${this.idGlobal}`
-        clone.placeholder !== undefined && (clone.placeholder += clone.label)
-        tempActiveData = clone
-      } else if (clone.layout === 'rowFormItem') {
-        delete clone.label
-        clone.componentName = `row${this.idGlobal}`
-        clone.gutter = this.formConf.gutter
-        tempActiveData = clone
-      }
+      const clone = deepClone(origin)
+      const config = clone.__config__
+      config.span = this.formConf.span // 生成代码时，会根据span做精简判断
+      this.createIdAndKey(clone)
+      clone.placeholder !== undefined && (clone.placeholder += config.label)
+      tempActiveData = clone
       return tempActiveData
+    },
+    createIdAndKey(item) {
+      const config = item.__config__
+      config.formId = ++this.idGlobal
+      config.renderKey = `${config.formId}${+new Date()}` // 改变renderKey后可以实现强制更新组件
+      if (config.layout === 'colFormItem') {
+        item.__vModel__ = `field${this.idGlobal}`
+      } else if (config.layout === 'rowFormItem') {
+        config.componentName = `row${this.idGlobal}`
+        !Array.isArray(config.children) && (config.children = [])
+        delete config.label // rowFormItem无需配置label属性
+      }
+      if (Array.isArray(config.children)) {
+        config.children = config.children.map(childItem => this.createIdAndKey(childItem))
+      }
+      return item
     },
     AssembleFormData() {
       this.formData = {
-        fields: JSON.parse(JSON.stringify(this.drawingList)),
+        fields: deepClone(this.drawingList),
         ...this.formConf
       }
     },
@@ -326,27 +368,14 @@ export default {
         }
       )
     },
-    drawingItemCopy(item, parent) {
-      let clone = JSON.parse(JSON.stringify(item))
+    drawingItemCopy(item, list) {
+      let clone = deepClone(item)
       clone = this.createIdAndKey(clone)
-      parent.push(clone)
+      list.push(clone)
       this.activeFormItem(clone)
     },
-    createIdAndKey(item) {
-      item.formId = ++this.idGlobal
-      item.renderKey = +new Date()
-      if (item.layout === 'colFormItem') {
-        item.vModel = `field${this.idGlobal}`
-      } else if (item.layout === 'rowFormItem') {
-        item.componentName = `row${this.idGlobal}`
-      }
-      if (Array.isArray(item.children)) {
-        item.children = item.children.map(childItem => this.createIdAndKey(childItem))
-      }
-      return item
-    },
-    drawingItemDelete(index, parent) {
-      parent.splice(index, 1)
+    drawingItemDelete(index, list) {
+      list.splice(index, 1)
       this.$nextTick(() => {
         const len = this.drawingList.length
         if (len) {
@@ -383,15 +412,18 @@ export default {
     },
     tagChange(newTag) {
       newTag = this.cloneComponent(newTag)
-      newTag.vModel = this.activeData.vModel
-      newTag.formId = this.activeId
-      newTag.span = this.activeData.span
-      delete this.activeData.tag
-      delete this.activeData.tagIcon
-      delete this.activeData.document
+      const config = newTag.__config__
+      newTag.__vModel__ = this.activeData.__vModel__
+      config.formId = this.activeId
+      config.span = this.activeData.__config__.span
+      this.activeData.__config__.tag = config.tag
+      this.activeData.__config__.tagIcon = config.tagIcon
+      this.activeData.__config__.document = config.document
+      if (typeof this.activeData.__config__.defaultValue === typeof config.defaultValue) {
+        config.defaultValue = this.activeData.__config__.defaultValue
+      }
       Object.keys(newTag).forEach(key => {
-        if (this.activeData[key] !== undefined
-          && typeof this.activeData[key] === typeof newTag[key]) {
+        if (this.activeData[key] !== undefined) {
           newTag[key] = this.activeData[key]
         }
       })
@@ -399,14 +431,19 @@ export default {
       this.updateDrawingList(newTag, this.drawingList)
     },
     updateDrawingList(newTag, list) {
-      const index = list.findIndex(item => item.formId === this.activeId)
+      const index = list.findIndex(item => item.__config__.formId === this.activeId)
       if (index > -1) {
         list.splice(index, 1, newTag)
       } else {
         list.forEach(item => {
-          if (Array.isArray(item.children)) this.updateDrawingList(newTag, item.children)
+          if (Array.isArray(item.__config__.children)) this.updateDrawingList(newTag, item.__config__.children)
         })
       }
+    },
+    refreshJson(data) {
+      this.drawingList = deepClone(data.fields)
+      delete data.fields
+      this.formConf = data
     }
   }
 }
